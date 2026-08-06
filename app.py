@@ -27,12 +27,7 @@ st.markdown("""
     [data-testid="stMetricLabel"] { font-size: 0.75rem !important; }
     .stButton>button { width: 100%; border-radius: 6px; height: 2.8rem; }
     .stDataFrame { width: 100% !important; }
-    /* Make tabs larger for touch targets */
-    button[data-baseweb="tab"] {
-        font-size: 1.1rem;
-        padding-top: 1rem;
-        padding-bottom: 1rem;
-    }
+    button[data-baseweb="tab"] { font-size: 1.1rem; padding-top: 1rem; padding-bottom: 1rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -63,6 +58,19 @@ def api_pages(path, max_pages=6):
             break
     return out
 
+def fetch_absolute_latest(device):
+    """Fallback fetch to get the last known record for devices not in the recent fleet pull."""
+    try:
+        url = f"{BASE_URL}/device_metrics/device/by-device-id/{device}/history/"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                return results[0] 
+    except Exception:
+        pass
+    return None
+
 def to_eat(ts):
     return pd.to_datetime(ts, utc=True).tz_convert(EAT)
 
@@ -90,24 +98,18 @@ def format_last_seen(ts, now):
 @st.cache_data(ttl=300)
 def load_locations():
     rows = api_pages("/devices/locations/")
-    # Added lat/lon extraction
     if not rows: return pd.DataFrame(columns=["device", "label", "lat", "lon"])
     
     df = pd.DataFrame(rows)
-    # Check for latitude/longitude in the payload. If they use different names in your API, adjust these:
     lat_col = "latitude" if "latitude" in df.columns else "lat" if "lat" in df.columns else None
     lon_col = "longitude" if "longitude" in df.columns else "lon" if "lon" in df.columns else None
     
     df = df.rename(columns={"device_name": "device", lat_col: "lat", lon_col: "lon"})
-    
-    # Exclude SEAS nodes
     df = df[~df["device"].str.contains("SEAS", case=False, na=False)]
     df["label"] = df["device"] + " — " + df["village"].fillna("Unknown") + ", " + df["division"].fillna("Unknown")
     
-    # Ensure coordinates are numeric for mapping
     if "lat" in df.columns and "lon" in df.columns:
-        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        df["lat"], df["lon"] = pd.to_numeric(df["lat"], errors="coerce"), pd.to_numeric(df["lon"], errors="coerce")
     else:
         df["lat"], df["lon"] = float('nan'), float('nan')
         
@@ -156,6 +158,17 @@ else:
     for col in ["time_uploaded", "battery_voltage", "panel_voltage", "sig_strength"]:
         fleet_df[col] = pd.NaT if col == "time_uploaded" else float('nan')
 
+# Deep-fetch for missing devices
+missing_idx = fleet_df[fleet_df["time_uploaded"].isna()].index
+for idx in missing_idx:
+    dev = fleet_df.loc[idx, "device"]
+    latest_rec = fetch_absolute_latest(dev)
+    if latest_rec:
+        fleet_df.loc[idx, "time_uploaded"] = to_eat(latest_rec.get("time_uploaded"))
+        fleet_df.loc[idx, "battery_voltage"] = latest_rec.get("battery_voltage")
+        fleet_df.loc[idx, "panel_voltage"] = latest_rec.get("panel_voltage")
+        fleet_df.loc[idx, "sig_strength"] = latest_rec.get("sig_strength")
+
 now = datetime.now(EAT)
 
 # Calculations
@@ -188,11 +201,9 @@ tab_dash, tab_map = st.tabs(["📋 Hardware List", "🗺️ Fleet Map"])
 # TAB 1: LIST AND CHARTS
 # ==============================================================================
 with tab_dash:
-    # Alerts
     has_alerts = False
     for _, r in fleet_df[~fleet_df["online"]].iterrows():
-        has_alerts = True
-        st.error(f"⚠️ **{r['device']}** OFFLINE ({r['elapsed_ago']})\n\n📍 *{r['label']}*\n\n📊 **Last Known:** Batt: `{r['bv_fmt']}` | Panel: `{r['pv_fmt']}`")
+        has_alerts, _ = True, st.error(f"⚠️ **{r['device']}** OFFLINE ({r['elapsed_ago']})\n\n📍 *{r['label']}*\n\n📊 **Last Known:** Panel: `{r['pv_fmt']}` | Batt: `{r['bv_fmt']}`")
 
     for _, r in fleet_df[fleet_df["charge_status"] == "CRITICAL"].iterrows():
         has_alerts, _ = True, st.error(f"🔴 **{r['device']}** CRITICAL BATT (`{r['bv_fmt']}`) · {r['label']}")
@@ -202,12 +213,12 @@ with tab_dash:
 
     if not has_alerts: st.success("✅ All registered devices online and operational.")
 
-    # Table
     st.subheader("📋 Fleet Hardware Status")
     st.caption("💡 *Tap any row below to trigger a deep-dive trace.*")
     
-    tbl = fleet_df[["device", "label", "online", "charge_status", "bv_fmt", "pv_fmt", "elapsed_ago", "last_seen_full"]].sort_values("device").reset_index(drop=True).copy()
-    tbl.columns = ["Device", "Location", "Online", "Status", "Last Batt", "Last Panel", "Age", "Last Upload Timestamp"]
+    # Swapped order: Panel first, then Battery
+    tbl = fleet_df[["device", "label", "online", "charge_status", "pv_fmt", "bv_fmt", "elapsed_ago", "last_seen_full"]].sort_values("device").reset_index(drop=True).copy()
+    tbl.columns = ["Device", "Location", "Online", "Status", "Last Panel", "Last Batt", "Age", "Last Upload Timestamp"]
     
     selection_event = st.dataframe(tbl, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row")
 
@@ -220,12 +231,23 @@ with tab_dash:
         with st.spinner("Fetching trace..."):
             df_f = load_history(selected_device, history_pages)
         if not df_f.empty:
-            fig_deep = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Voltage Rails (V)", "GSM Signal Strength"], vertical_spacing=0.12, row_heights=[0.6, 0.4])
-            fig_deep.add_trace(go.Scatter(x=df_f["time_uploaded"], y=df_f["battery_voltage"], name="Battery", line=dict(color=C["battery"])), row=1, col=1)
-            fig_deep.add_trace(go.Scatter(x=df_f["time_uploaded"], y=df_f["panel_voltage"], name="Panel", line=dict(color=C["panel"], dash="dash")), row=1, col=1)
-            fig_deep.add_trace(go.Scatter(x=df_f["time_uploaded"], y=df_f["sig_strength"], name="Signal", line=dict(color=C["purple"])), row=2, col=1)
-            fig_deep.update_layout(template=PT, height=420, margin=dict(t=30, b=20, l=35, r=10))
-            st.plotly_chart(fig_deep, use_container_width=True)
+            # Side-by-side Layout for Panel (Left) and Battery (Right)
+            col_panel, col_batt = st.columns(2)
+            
+            with col_panel:
+                fig_p = go.Figure(go.Scatter(x=df_f["time_uploaded"], y=df_f["panel_voltage"], name="Panel", line=dict(color=C["panel"])))
+                fig_p.update_layout(template=PT, title="Panel Voltage (V)", height=300, margin=dict(t=40, b=20, l=10, r=10))
+                st.plotly_chart(fig_p, use_container_width=True)
+                
+            with col_batt:
+                fig_b = go.Figure(go.Scatter(x=df_f["time_uploaded"], y=df_f["battery_voltage"], name="Battery", line=dict(color=C["battery"])))
+                fig_b.update_layout(template=PT, title="Battery Voltage (V)", height=300, margin=dict(t=40, b=20, l=10, r=10))
+                st.plotly_chart(fig_b, use_container_width=True)
+
+            # Signal Strength spanning full width underneath
+            fig_sig = go.Figure(go.Scatter(x=df_f["time_uploaded"], y=df_f["sig_strength"], name="Signal", line=dict(color=C["purple"])))
+            fig_sig.update_layout(template=PT, title="GSM Signal Strength", height=250, margin=dict(t=40, b=20, l=10, r=10))
+            st.plotly_chart(fig_sig, use_container_width=True)
         else:
             st.info("No recorded trace data found.")
     else:
@@ -239,15 +261,13 @@ with tab_map:
     map_df = fleet_df.dropna(subset=['lat', 'lon'])
     
     if not map_df.empty:
-        # Create tooltip text
         map_df["hover_text"] = (
             "<b>" + map_df["device"] + "</b><br>" +
             "📍 " + map_df["label"] + "<br>" +
-            "🔋 Batt: " + map_df["bv_fmt"] + " (" + map_df["charge_status"] + ")<br>" +
+            "⚡ Panel: " + map_df["pv_fmt"] + " | 🔋 Batt: " + map_df["bv_fmt"] + "<br>" +
             "📡 Last Seen: " + map_df["elapsed_ago"]
         )
         
-        # Plotly Scattermapbox
         fig_map = go.Figure(go.Scattermapbox(
             lat=map_df["lat"],
             lon=map_df["lon"],
@@ -261,15 +281,15 @@ with tab_map:
             hoverinfo="text"
         ))
         
-        # Dynamic centering based on actual data
-        center_lat = map_df["lat"].mean()
-        center_lon = map_df["lon"].mean()
+        # Hardcoded center to precisely frame the geography of Uganda
+        center_lat = 1.3733
+        center_lon = 32.2903
         
         fig_map.update_layout(
-            mapbox_style="carto-darkmatter", # Fits the dark UI perfectly
+            mapbox_style="carto-darkmatter", 
             mapbox=dict(
                 center=dict(lat=center_lat, lon=center_lon),
-                zoom=10.5 # Good default zoom for regional deployment
+                zoom=6.5 # Scaled nicely for a country-wide overview
             ),
             margin={"r":0, "t":10, "l":0, "b":0},
             height=600,
@@ -277,4 +297,4 @@ with tab_map:
         )
         st.plotly_chart(fig_map, use_container_width=True)
     else:
-        st.warning("⚠️ No valid GPS coordinates (latitude/longitude) were found in the location data. Ensure the API is returning 'lat' and 'lon' or 'latitude' and 'longitude'.")
+        st.warning("⚠️ No valid GPS coordinates found.")
