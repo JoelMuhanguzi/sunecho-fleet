@@ -59,7 +59,6 @@ def api_pages(path, max_pages=6):
     return out
 
 def fetch_absolute_latest(device):
-    """Fallback fetch to get the last known record for devices not in the recent fleet pull."""
     try:
         url = f"{BASE_URL}/device_metrics/device/by-device-id/{device}/history/"
         r = requests.get(url, timeout=10)
@@ -146,7 +145,6 @@ with st.sidebar:
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("🔋 SunEcho Ops Monitor")
 
-# Fetch Data
 with st.spinner("Connecting to telemetry backend..."):
     loc_df = load_locations()
     fleet_metrics = load_fleet()
@@ -178,7 +176,7 @@ fleet_df["elapsed_ago"] = [t[1] for t in ts_formatted]
 fleet_df["online"] = fleet_df["time_uploaded"].apply(lambda ts: False if pd.isna(ts) else (now - ts).total_seconds() / 60 < 30)
 fleet_df[["charge_status", "sc"]] = fleet_df.apply(lambda r: pd.Series(charge_status(r["battery_voltage"], r["panel_voltage"], r["device"], batt_low, batt_crit, r["online"])), axis=1)
 
-# Formatting for UI
+# Formatting
 fleet_df["bv_fmt"] = fleet_df["battery_voltage"].apply(lambda v: f"{v:.2f}V" if pd.notna(v) else "N/A")
 fleet_df["pv_fmt"] = fleet_df["panel_voltage"].apply(lambda v: f"{v:.2f}V" if pd.notna(v) else "N/A")
 
@@ -216,7 +214,6 @@ with tab_dash:
     st.subheader("📋 Fleet Hardware Status")
     st.caption("💡 *Tap any row below to trigger a deep-dive trace.*")
     
-    # Swapped order: Panel first, then Battery
     tbl = fleet_df[["device", "label", "online", "charge_status", "pv_fmt", "bv_fmt", "elapsed_ago", "last_seen_full"]].sort_values("device").reset_index(drop=True).copy()
     tbl.columns = ["Device", "Location", "Online", "Status", "Last Panel", "Last Batt", "Age", "Last Upload Timestamp"]
     
@@ -224,16 +221,13 @@ with tab_dash:
 
     selected_device = tbl.iloc[selection_event.selection.rows[0]]["Device"] if selection_event and selection_event.selection and selection_event.selection.rows else None
 
-    # Deep Dive
     st.divider()
     if selected_device:
         st.subheader(f"🔍 Trace: {selected_device}")
         with st.spinner("Fetching trace..."):
             df_f = load_history(selected_device, history_pages)
         if not df_f.empty:
-            # Side-by-side Layout for Panel (Left) and Battery (Right)
             col_panel, col_batt = st.columns(2)
-            
             with col_panel:
                 fig_p = go.Figure(go.Scatter(x=df_f["time_uploaded"], y=df_f["panel_voltage"], name="Panel", line=dict(color=C["panel"])))
                 fig_p.update_layout(template=PT, title="Panel Voltage (V)", height=300, margin=dict(t=40, b=20, l=10, r=10))
@@ -244,7 +238,6 @@ with tab_dash:
                 fig_b.update_layout(template=PT, title="Battery Voltage (V)", height=300, margin=dict(t=40, b=20, l=10, r=10))
                 st.plotly_chart(fig_b, use_container_width=True)
 
-            # Signal Strength spanning full width underneath
             fig_sig = go.Figure(go.Scatter(x=df_f["time_uploaded"], y=df_f["sig_strength"], name="Signal", line=dict(color=C["purple"])))
             fig_sig.update_layout(template=PT, title="GSM Signal Strength", height=250, margin=dict(t=40, b=20, l=10, r=10))
             st.plotly_chart(fig_sig, use_container_width=True)
@@ -281,15 +274,29 @@ with tab_map:
             hoverinfo="text"
         ))
         
-        # Hardcoded center to precisely frame the geography of Uganda
-        center_lat = 1.3733
-        center_lon = 32.2903
+        # Dynamic centering based on active fleet
+        center_lat = map_df["lat"].mean()
+        center_lon = map_df["lon"].mean()
+        
+        # Dynamic zoom calculation based on coordinate spread
+        lat_spread = map_df["lat"].max() - map_df["lat"].min()
+        lon_spread = map_df["lon"].max() - map_df["lon"].min()
+        max_spread = max(lat_spread, lon_spread)
+        
+        if max_spread == 0:
+            zoom_level = 14  # Single point
+        elif max_spread < 0.1:
+            zoom_level = 12  # Very tight cluster
+        elif max_spread < 0.5:
+            zoom_level = 10  # Regional spread
+        else:
+            zoom_level = 7   # Country-wide spread
         
         fig_map.update_layout(
-            mapbox_style="carto-darkmatter", 
+            mapbox_style="open-street-map", # Full color standard map
             mapbox=dict(
                 center=dict(lat=center_lat, lon=center_lon),
-                zoom=6.5 # Scaled nicely for a country-wide overview
+                zoom=zoom_level
             ),
             margin={"r":0, "t":10, "l":0, "b":0},
             height=600,
