@@ -17,17 +17,22 @@ st.set_page_config(
 # ── Custom CSS for Mobile & Field Responsiveness ──────────────────────────────
 st.markdown("""
 <style>
+    /* Drastically cut top padding to reclaim screen space */
     .main .block-container {
-        padding-top: 1rem !important;
+        padding-top: 0.2rem !important; 
         padding-bottom: 1rem !important;
         padding-left: 0.6rem !important;
         padding-right: 0.6rem !important;
     }
+    /* Compact metric cards on mobile */
     [data-testid="stMetricValue"] { font-size: 1.25rem !important; }
     [data-testid="stMetricLabel"] { font-size: 0.75rem !important; }
+    /* Touch-friendly tabs and buttons */
     .stButton>button { width: 100%; border-radius: 6px; height: 2.8rem; }
     .stDataFrame { width: 100% !important; }
     button[data-baseweb="tab"] { font-size: 1.1rem; padding-top: 1rem; padding-bottom: 1rem; }
+    /* Tighten header spacing */
+    h3 { margin-top: 0rem !important; padding-top: 0rem !important; padding-bottom: 0.2rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -73,9 +78,34 @@ def fetch_absolute_latest(device):
 def to_eat(ts):
     return pd.to_datetime(ts, utc=True).tz_convert(EAT)
 
-def charge_status(bv, pv, dev, batt_low, batt_crit, is_online):
+def get_network_status(ts, bv, now):
+    """Calculates status based on Arduino dynamic cycle timing and 3.5V TX gate."""
+    if pd.isna(ts) or pd.isna(bv): return False, "NO DATA", "#484f58"
+    
+    mins_ago = (now - ts).total_seconds() / 60.0
+    
+    # 3.5V Gate: TX is skipped below this to save power
+    if bv < 3.5:
+        # If we heard from it in the last 12 hours, it's just sleeping/charging.
+        if mins_ago < 720: 
+            return False, "HIBERNATING", "#bc8cff" # Purple for sleep state
+        else: 
+            return False, "OFFLINE", "#8b949e"
+            
+    # Dynamic Expected Intervals (~8s per micro-cycle)
+    if bv >= 4.0: expected_interval = 5      # 30 cycles
+    elif bv >= 3.9: expected_interval = 10   # 60 cycles
+    elif bv >= 3.7: expected_interval = 30   # 180 cycles
+    else: expected_interval = 60             # 360 cycles
+    
+    # Online = Within 3 missed TX windows + 10 mins buffer
+    if mins_ago <= (expected_interval * 3) + 10: 
+        return True, "ONLINE", "#3fb950"
+    
+    return False, "OFFLINE", "#8b949e"
+
+def charge_status(bv, pv, dev, batt_low, batt_crit):
     if pd.isna(bv):      return "NO RECORD", "#484f58"
-    if not is_online:    return "OFFLINE / STALE", "#8b949e"
     if bv < batt_crit:   return "CRITICAL", "#f85149"
     if bv < batt_low:    return "LOW",      "#d29922"
     if dev in UNREG:     return "OK (unreg)", "#3fb950"
@@ -83,35 +113,27 @@ def charge_status(bv, pv, dev, batt_low, batt_crit, is_online):
     return "OK / idle",  "#3fb950"
 
 def format_last_seen(ts, now):
-    if pd.isna(ts): 
-        return "No history", "Never"
+    if pd.isna(ts): return "No history", "Never"
     delta = now - ts
-    days = delta.days
-    secs = delta.seconds
-    
+    days, secs = delta.days, delta.seconds
     date_str = ts.strftime('%m-%d %H:%M')
     ago_str = f"{days}d {secs // 3600}h ago" if days > 0 else f"{secs // 3600}h {(secs % 3600) // 60}m ago" if secs >= 3600 else f"{(secs % 3600) // 60}m ago"
-        
     return f"{date_str} ({ago_str})", ago_str
 
 @st.cache_data(ttl=300)
 def load_locations():
     rows = api_pages("/devices/locations/")
     if not rows: return pd.DataFrame(columns=["device", "label", "lat", "lon"])
-    
     df = pd.DataFrame(rows)
     lat_col = "latitude" if "latitude" in df.columns else "lat" if "lat" in df.columns else None
     lon_col = "longitude" if "longitude" in df.columns else "lon" if "lon" in df.columns else None
-    
     df = df.rename(columns={"device_name": "device", lat_col: "lat", lon_col: "lon"})
     df = df[~df["device"].str.contains("SEAS", case=False, na=False)]
     df["label"] = df["device"] + " — " + df["village"].fillna("Unknown") + ", " + df["division"].fillna("Unknown")
-    
     if "lat" in df.columns and "lon" in df.columns:
         df["lat"], df["lon"] = pd.to_numeric(df["lat"], errors="coerce"), pd.to_numeric(df["lon"], errors="coerce")
     else:
         df["lat"], df["lon"] = float('nan'), float('nan')
-        
     return df[["device", "label", "lat", "lon"]]
 
 @st.cache_data(ttl=60)
@@ -142,8 +164,8 @@ with st.sidebar:
     if st.button("🔄 Force Refresh Telemetry", type="primary"):
         st.cache_data.clear()
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.title("🔋 SunEcho Ops Monitor")
+# ── Compact Header ────────────────────────────────────────────────────────────
+st.markdown("### 🔋 SunEcho Ops Monitor")
 
 with st.spinner("Connecting to telemetry backend..."):
     loc_df = load_locations()
@@ -173,18 +195,23 @@ now = datetime.now(EAT)
 ts_formatted = fleet_df["time_uploaded"].apply(lambda ts: format_last_seen(ts, now))
 fleet_df["last_seen_full"] = [t[0] for t in ts_formatted]
 fleet_df["elapsed_ago"] = [t[1] for t in ts_formatted]
-fleet_df["online"] = fleet_df["time_uploaded"].apply(lambda ts: False if pd.isna(ts) else (now - ts).total_seconds() / 60 < 30)
-fleet_df[["charge_status", "sc"]] = fleet_df.apply(lambda r: pd.Series(charge_status(r["battery_voltage"], r["panel_voltage"], r["device"], batt_low, batt_crit, r["online"])), axis=1)
+
+# Apply Smart Network & Power Status
+status_data = fleet_df.apply(lambda r: pd.Series(get_network_status(r["time_uploaded"], r["battery_voltage"], now)), axis=1)
+fleet_df[["is_online", "net_status", "net_color"]] = status_data
+fleet_df["online"] = fleet_df["is_online"] # Fallback for sorting
+
+fleet_df[["charge_status", "sc"]] = fleet_df.apply(lambda r: pd.Series(charge_status(r["battery_voltage"], r["panel_voltage"], r["device"], batt_low, batt_crit)), axis=1)
 
 # Formatting
 fleet_df["bv_fmt"] = fleet_df["battery_voltage"].apply(lambda v: f"{v:.2f}V" if pd.notna(v) else "N/A")
 fleet_df["pv_fmt"] = fleet_df["panel_voltage"].apply(lambda v: f"{v:.2f}V" if pd.notna(v) else "N/A")
 
-# ── Top KPIs ──────────────────────────────────────────────────────────────────
+# ── Dynamic KPIs ──────────────────────────────────────────────────────────────
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Online", f"{int(fleet_df['online'].sum())}/{len(fleet_df)}")
-c2.metric("Offline", len(fleet_df) - int(fleet_df["online"].sum()))
-c3.metric("Charging", int((fleet_df["charge_status"] == "CHARGING").sum()))
+c1.metric("Online", int((fleet_df['net_status'] == 'ONLINE').sum()))
+c2.metric("Sleep", int((fleet_df['net_status'] == 'HIBERNATING').sum()))
+c3.metric("Offline", int((fleet_df['net_status'] == 'OFFLINE').sum()))
 c4.metric("Low/Crit", int((fleet_df["charge_status"].isin(["LOW", "CRITICAL"])).sum()))
 
 if st.button("🔄 Tap to Refresh Status"):
@@ -199,18 +226,20 @@ tab_dash, tab_map = st.tabs(["📋 Hardware List", "🗺️ Fleet Map"])
 # TAB 1: LIST AND CHARTS
 # ==============================================================================
 with tab_dash:
-    # ── SPACE SAVER: Collapsible Alerts ───────────────────────────────────────
-    offline_nodes = fleet_df[~fleet_df["online"]]
+    # ── SPACE SAVER: Collapsible Smart Alerts ─────────────────────────────────
+    hib_nodes = fleet_df[fleet_df["net_status"] == "HIBERNATING"]
+    off_nodes = fleet_df[fleet_df["net_status"] == "OFFLINE"]
     crit_nodes = fleet_df[fleet_df["charge_status"] == "CRITICAL"]
     low_nodes = fleet_df[fleet_df["charge_status"] == "LOW"]
     
-    total_alerts = len(offline_nodes) + len(crit_nodes) + len(low_nodes)
+    total_alerts = len(hib_nodes) + len(off_nodes) + len(crit_nodes) + len(low_nodes)
     
     if total_alerts > 0:
-        # Puts everything into a neat dropdown accordion
-        with st.expander(f"🚨 Tap to view {total_alerts} Active Alerts", expanded=False):
-            for _, r in offline_nodes.iterrows():
-                st.markdown(f"⚠️ **{r['device']}** OFFLINE ({r['elapsed_ago']}) · 📍 {r['label']} · Batt: `{r['bv_fmt']}`")
+        with st.expander(f"🚨 Tap to view {total_alerts} Active Status Alerts", expanded=False):
+            for _, r in hib_nodes.iterrows():
+                st.markdown(f"💤 **{r['device']}** HIBERNATING (Batt < 3.5V, TX Paused) · 📍 *{r['label']}*")
+            for _, r in off_nodes.iterrows():
+                st.markdown(f"⚠️ **{r['device']}** OFFLINE ({r['elapsed_ago']}) · 📍 *{r['label']}* · Batt: `{r['bv_fmt']}`")
             for _, r in crit_nodes.iterrows():
                 st.markdown(f"🔴 **{r['device']}** CRITICAL BATT (`{r['bv_fmt']}`) · {r['label']}")
             for _, r in low_nodes.iterrows():
@@ -218,30 +247,30 @@ with tab_dash:
     else:
         st.success("✅ All registered devices online and operational.")
 
-    st.subheader("📋 Fleet Hardware Status")
     st.caption("💡 *Tap any row below to trigger a deep-dive trace.*")
     
-    # Priority Sort
+    # Priority Sort: Network status hierarchy, then numerical
     fleet_df["num_id"] = fleet_df["device"].str.extract(r'(\d+)').astype(float)
-    tbl = fleet_df.sort_values(by=["online", "num_id"]).reset_index(drop=True).copy()
+    # Mapping custom sort weights: Offline=0, Hibernating=1, Online=2 (Floats offline to top)
+    fleet_df["sort_weight"] = fleet_df["net_status"].map({"OFFLINE": 0, "HIBERNATING": 1, "ONLINE": 2})
+    tbl = fleet_df.sort_values(by=["sort_weight", "num_id"]).reset_index(drop=True).copy()
     
-    tbl = tbl[["device", "label", "online", "charge_status", "pv_fmt", "bv_fmt", "elapsed_ago", "last_seen_full"]]
-    tbl.columns = ["Device", "Location", "Online", "Status", "Last Panel", "Last Batt", "Age", "Last Upload Timestamp"]
+    tbl = tbl[["device", "label", "net_status", "charge_status", "pv_fmt", "bv_fmt", "elapsed_ago", "last_seen_full"]]
+    tbl.columns = ["Device", "Location", "Network", "Power", "Last Panel", "Last Batt", "Age", "Last Upload Timestamp"]
     
-    # ── SPACE SAVER: Increased Table Height ───────────────────────────────────
     selection_event = st.dataframe(
         tbl, 
         use_container_width=True, 
         hide_index=True, 
-        height=550, # Forces the table window to be much taller on mobile
+        height=550, 
         on_select="rerun", 
         selection_mode="single-row"
     )
 
     selected_device = tbl.iloc[selection_event.selection.rows[0]]["Device"] if selection_event and selection_event.selection and selection_event.selection.rows else None
 
-    st.divider()
     if selected_device:
+        st.divider()
         st.subheader(f"🔍 Trace: {selected_device}")
         with st.spinner("Fetching trace..."):
             df_f = load_history(selected_device, history_pages)
@@ -263,21 +292,20 @@ with tab_dash:
         else:
             st.info("No recorded trace data found.")
     else:
-        st.info("👆 Tap a row in the table to view history.")
+        st.info("👆 Tap a row in the table above to view history.")
 
 # ==============================================================================
 # TAB 2: MAP VIEW
 # ==============================================================================
 with tab_map:
-    st.subheader("🗺️ Node Geography & Status")
     map_df = fleet_df.dropna(subset=['lat', 'lon'])
     
     if not map_df.empty:
         map_df["hover_text"] = (
             "<b>" + map_df["device"] + "</b><br>" +
             "📍 " + map_df["label"] + "<br>" +
-            "⚡ Panel: " + map_df["pv_fmt"] + " | 🔋 Batt: " + map_df["bv_fmt"] + "<br>" +
-            "📡 Last Seen: " + map_df["elapsed_ago"]
+            "📡 Net: " + map_df["net_status"] + " (" + map_df["elapsed_ago"] + ")<br>" +
+            "⚡ Panel: " + map_df["pv_fmt"] + " | 🔋 Batt: " + map_df["bv_fmt"]
         )
         
         fig_map = go.Figure(go.Scattermapbox(
@@ -286,30 +314,24 @@ with tab_map:
             mode='markers',
             marker=go.scattermapbox.Marker(
                 size=16, 
-                color=map_df["sc"].tolist(), 
+                color=map_df["net_color"].tolist(), # Colors pins based on Network Status 
                 opacity=0.85
             ),
             text=map_df["hover_text"],
             hoverinfo="text"
         ))
         
-        # Dynamic centering based on active fleet
         center_lat = map_df["lat"].mean()
         center_lon = map_df["lon"].mean()
         
-        # Dynamic zoom calculation based on coordinate spread
         lat_spread = map_df["lat"].max() - map_df["lat"].min()
         lon_spread = map_df["lon"].max() - map_df["lon"].min()
         max_spread = max(lat_spread, lon_spread)
         
-        if max_spread == 0:
-            zoom_level = 14  # Single point
-        elif max_spread < 0.1:
-            zoom_level = 12  # Very tight cluster
-        elif max_spread < 0.5:
-            zoom_level = 10  # Regional spread
-        else:
-            zoom_level = 7   # Country-wide spread
+        if max_spread == 0: zoom_level = 14
+        elif max_spread < 0.1: zoom_level = 12
+        elif max_spread < 0.5: zoom_level = 10
+        else: zoom_level = 7
         
         fig_map.update_layout(
             mapbox_style="open-street-map",
