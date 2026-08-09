@@ -199,25 +199,44 @@ tab_dash, tab_map = st.tabs(["📋 Hardware List", "🗺️ Fleet Map"])
 # TAB 1: LIST AND CHARTS
 # ==============================================================================
 with tab_dash:
-    has_alerts = False
-    for _, r in fleet_df[~fleet_df["online"]].iterrows():
-        has_alerts, _ = True, st.error(f"⚠️ **{r['device']}** OFFLINE ({r['elapsed_ago']})\n\n📍 *{r['label']}*\n\n📊 **Last Known:** Panel: `{r['pv_fmt']}` | Batt: `{r['bv_fmt']}`")
-
-    for _, r in fleet_df[fleet_df["charge_status"] == "CRITICAL"].iterrows():
-        has_alerts, _ = True, st.error(f"🔴 **{r['device']}** CRITICAL BATT (`{r['bv_fmt']}`) · {r['label']}")
-
-    for _, r in fleet_df[fleet_df["charge_status"] == "LOW"].iterrows():
-        has_alerts, _ = True, st.warning(f"🟡 **{r['device']}** LOW BATT (`{r['bv_fmt']}`) · {r['label']}")
-
-    if not has_alerts: st.success("✅ All registered devices online and operational.")
+    # ── SPACE SAVER: Collapsible Alerts ───────────────────────────────────────
+    offline_nodes = fleet_df[~fleet_df["online"]]
+    crit_nodes = fleet_df[fleet_df["charge_status"] == "CRITICAL"]
+    low_nodes = fleet_df[fleet_df["charge_status"] == "LOW"]
+    
+    total_alerts = len(offline_nodes) + len(crit_nodes) + len(low_nodes)
+    
+    if total_alerts > 0:
+        # Puts everything into a neat dropdown accordion
+        with st.expander(f"🚨 Tap to view {total_alerts} Active Alerts", expanded=False):
+            for _, r in offline_nodes.iterrows():
+                st.markdown(f"⚠️ **{r['device']}** OFFLINE ({r['elapsed_ago']}) · 📍 {r['label']} · Batt: `{r['bv_fmt']}`")
+            for _, r in crit_nodes.iterrows():
+                st.markdown(f"🔴 **{r['device']}** CRITICAL BATT (`{r['bv_fmt']}`) · {r['label']}")
+            for _, r in low_nodes.iterrows():
+                st.markdown(f"🟡 **{r['device']}** LOW BATT (`{r['bv_fmt']}`) · {r['label']}")
+    else:
+        st.success("✅ All registered devices online and operational.")
 
     st.subheader("📋 Fleet Hardware Status")
     st.caption("💡 *Tap any row below to trigger a deep-dive trace.*")
     
-    tbl = fleet_df[["device", "label", "online", "charge_status", "pv_fmt", "bv_fmt", "elapsed_ago", "last_seen_full"]].sort_values("device").reset_index(drop=True).copy()
+    # Priority Sort
+    fleet_df["num_id"] = fleet_df["device"].str.extract(r'(\d+)').astype(float)
+    tbl = fleet_df.sort_values(by=["online", "num_id"]).reset_index(drop=True).copy()
+    
+    tbl = tbl[["device", "label", "online", "charge_status", "pv_fmt", "bv_fmt", "elapsed_ago", "last_seen_full"]]
     tbl.columns = ["Device", "Location", "Online", "Status", "Last Panel", "Last Batt", "Age", "Last Upload Timestamp"]
     
-    selection_event = st.dataframe(tbl, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row")
+    # ── SPACE SAVER: Increased Table Height ───────────────────────────────────
+    selection_event = st.dataframe(
+        tbl, 
+        use_container_width=True, 
+        hide_index=True, 
+        height=550, # Forces the table window to be much taller on mobile
+        on_select="rerun", 
+        selection_mode="single-row"
+    )
 
     selected_device = tbl.iloc[selection_event.selection.rows[0]]["Device"] if selection_event and selection_event.selection and selection_event.selection.rows else None
 
@@ -293,7 +312,7 @@ with tab_map:
             zoom_level = 7   # Country-wide spread
         
         fig_map.update_layout(
-            mapbox_style="open-street-map", # Full color standard map
+            mapbox_style="open-street-map",
             mapbox=dict(
                 center=dict(lat=center_lat, lon=center_lon),
                 zoom=zoom_level
